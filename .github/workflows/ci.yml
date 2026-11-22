@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancela ejecuciones viejas de la misma rama o PR
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verificacion:
+    name: Pruebas, cobertura y análisis SonarCloud
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # SonarCloud necesita el historial completo para detectar código nuevo
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # mvnw puede llegar sin permiso de ejecución si el repo se subió desde Windows
+      - name: Permiso de ejecución del wrapper
+        run: chmod +x mvnw
+
+      # Ejecuta todas las pruebas: unitarias, reglas de arquitectura (ArchUnit / Spring Modulith, ADR-001 y ADR-013)
+      # y de integración con PostgreSQL real vía Testcontainers (Docker ya viene en el runner).
+      - name: Compilar, probar y medir cobertura
+        run: ./mvnw -B -ntp verify
+
+      - name: Guardar reportes de pruebas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reportes-pruebas
+          path: |
+            target/surefire-reports
+            target/site/jacoco
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # Los PR desde forks no reciben secretos: en ese caso se omite el análisis en lugar de fallar.
+      - name: Análisis de SonarCloud
+        if: env.SONAR_TOKEN != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # para decorar el PR
+        run: ./mvnw -B -ntp -DskipTests org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
+        # Para que el pipeline FALLE cuando no se cumple el Quality Gate, agrega al comando: -Dsonar.qualitygate.wait=true
+
+  imagen:
+    name: Publicar imagen en GHCR
+    needs: verificacion
+    # Solo en main (ADR-016: GitHub Actions publica la imagen en GHCR y la plataforma la despliega)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
